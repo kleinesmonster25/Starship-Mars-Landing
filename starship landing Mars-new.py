@@ -47,6 +47,7 @@ HOVER_ALTITUDE = 100
 MAX_ALTITUDE = 500000  # 500 km orbit
 ORBIT_VELOCITY = 3319  # Approx. orbital velocity at 500 km
 MAX_VELOCITY = 4000
+MAX_FUEL = 1000000  # Maximum fuel capacity
 
 class Vector3D:
     def __init__(self, x, y, z):
@@ -133,7 +134,7 @@ class Starship:
                 if self.position.z < 500:
                     pitch = 90
                 else:
-                    pitch = max(0, 90 - ((self.position.z - 500) / (200000 - 500)) * 90)  # Reach 0° at 200 km
+                    pitch = max(0, 90 - ((self.position.z - 500) / (300000 - 500)) * 90)  # Reach 0° at 300 km
                 pitch_rad = math.radians(pitch)
                 thrust_z = self.thrust * math.sin(pitch_rad)
                 thrust_x = self.thrust * math.cos(pitch_rad)
@@ -154,8 +155,8 @@ class Starship:
             fuel_used = mass_flow_rate * delta_time
             fuel_used = min(fuel_used, self.fuel)
             self.fuel -= fuel_used
-            if iterations % 500 == 0:
-                logging.debug(f"Fuel used this step: {fuel_used:.1f} kg, Mass flow rate: {mass_flow_rate:.1f} kg/s")
+            if iterations % 100 == 0:  # More frequent logging
+                logging.debug(f"Fuel used this step: {fuel_used:.1f} kg, Mass flow rate: {mass_flow_rate:.1f} kg/s, Remaining fuel: {self.fuel:.1f} kg")
 
         self.velocity_smoothing.append(self.velocity.z)
         if len(self.velocity_smoothing) > 3:
@@ -301,9 +302,9 @@ class Starship:
                         if horizontal_velocity >= ORBIT_VELOCITY:
                             logging.info("Orbit achieved at 500 km with sufficient velocity!")
                             print("Orbit achieved at 500 km with sufficient velocity!")
-                            self.fuel = 900000
-                            logging.info("Refueled with 900,000 kg in 500 km orbit.")
-                            print("Refueled with 900,000 kg in 500 km orbit.")
+                            self.fuel = MAX_FUEL  # Refuel to 1,000,000 kg
+                            logging.info(f"Refueled with {MAX_FUEL:.1f} kg in 500 km orbit.")
+                            print(f"Refueled with {MAX_FUEL:.1f} kg in 500 km orbit.")
                             landing_fuel_required = 100000
                             if self.fuel >= landing_fuel_required:
                                 self.fuel -= landing_fuel_required
@@ -440,9 +441,10 @@ class PIDController:
             return 0
 
 if __name__ == "__main__":
+    logging.info("Starting Mars mission simulation with updated code (2025-05-05)")
     test_cases = [
         {"name": "Landing Nominal", "mode": "land", "fuel": 300000, "seed": 46},
-        {"name": "Launch to Orbit", "mode": "launch", "fuel": 1000000, "seed": 47}  # Increased to 1M kg
+        {"name": "Launch to Orbit", "mode": "launch", "fuel": 1000000, "seed": 47}
     ]
 
     for test in test_cases:
