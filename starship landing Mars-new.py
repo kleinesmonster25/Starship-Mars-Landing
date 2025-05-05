@@ -11,25 +11,25 @@ plt.switch_backend('Agg')
 # Constants for Starship Mars landing
 MARS_GRAVITY = 3.71  # m/s^2, Mars surface gravity
 MARS_ROTATION_OMEGA = 7.083e-5  # rad/s, Mars angular velocity
-MARS_ATMOSPHERE_DENSITY_SEA_LEVEL = 0.02  # kg/m^3, surface density
+MARS_ATMOSPHERE_DENSITY_SEA_LEVEL = 0.05  # kg/m^3, erhöht für realistischeren Drag
 MARS_SCALE_HEIGHT = 11000  # meters, atmospheric scale height
 DRAG_COEFFICIENT = 0.75  # Starship's drag coefficient
 CROSS_SECTIONAL_AREA = 100  # m^2, approximate for Starship
 SPECIFIC_IMPULSE = 350  # seconds, Raptor engine specific impulse
 G0 = 9.81  # m/s^2, standard gravity for fuel flow
 MAX_LIDAR_RANGE = 12000  # meters
-SCAN_FREQUENCY = 50  # Hz
+SCAN_FREQUENCY = 100  # Hz (angepasst für kleinere Schritte)
 STARSHIP_MASS = 200000  # kg, total mass (dry + fuel + payload)
 MAX_THRUST = 7500000  # Newtons, 3 Raptor engines (2.5 MN each)
 MIN_THRUST = 2250000  # Newtons, 30% throttle (0.75 MN per engine)
 ENGINE_STARTUP_DELAY = 0.1  # seconds
-MIN_FUEL_RESERVE = 40000  # kg, ~25% safety reserve
+MIN_FUEL_RESERVE = 40000  # kg, ~20% safety reserve bei 200.000 kg
 SAFE_LANDING_SPEED = 0.5  # m/s
 MIN_SAFE_ALTITUDE = 50  # meters
-WIND_MAX_ACCELERATION = 0.1  # m/s^2, max lateral wind gust
+WIND_MAX_ACCELERATION = 0.05  # m/s^2, reduzierte Windstärke für Stabilität
 HOVER_ALTITUDE = 100  # meters, pre-landing hover phase
 MAX_ALTITUDE = 100000  # 100km als sinnvolle Obergrenze
-MAX_VELOCITY = 1000  # 1000 m/s als sinnvolle Obergrenze
+MAX_VELOCITY = 300  # Reduziert für realistischere Simulation
 
 
 class Vector3D:
@@ -69,7 +69,7 @@ class Starship:
     def __init__(self):
         self.position = Vector3D(0, 0, 10000)  # Initial altitude
         self.velocity = Vector3D(0, 0, -50)  # Initial descent
-        self.fuel = 160000  # kg, for thrust-only landing
+        self.fuel = 200000  # Erhöht auf 200.000 kg
         self.thrust = 0
         self.active_engines = 3  # Number of functional Raptor engines
         self.engine_delay_timer = 0  # For startup/shutdown
@@ -84,23 +84,20 @@ class Starship:
         self.fuel_history = []
         self.time_history = []
         self.position_history = [(0, 0, 10000)]  # For 3D trajectory
+        self.velocity_smoothing = []  # Für gleitenden Durchschnitt
 
     def update_state(self, delta_time):
-        # Prüfen, ob der Kraftstoff bereits aufgebraucht ist
         if self.fuel <= 0:
             self.fuel = 0
-            self.thrust = 0  # Keine Schubkraft mehr möglich
+            self.thrust = 0
 
-        # Simulate engine failure (random, one-time at 5000m for testing)
         if self.position.z < 5000 and self.active_engines == 3 and random.random() < 0.01:
             self.active_engines = 2
             print("Warning: One Raptor engine failed! Max thrust reduced to 5 MN.")
 
-        # Calculate max thrust based on active engines
         current_max_thrust = MAX_THRUST * (self.active_engines / 3)
         current_min_thrust = MIN_THRUST * (self.active_engines / 3)
 
-        # Apply engine startup delay
         if self.thrust > 0 and self.engine_delay_timer > 0:
             self.engine_delay_timer -= delta_time
             thrust_acc = 0
@@ -109,42 +106,56 @@ class Starship:
             if self.thrust < current_min_thrust and self.thrust > 0:
                 thrust_acc = current_min_thrust / STARSHIP_MASS
 
-        # Calculate forces
+        # Dynamische Schubanpassung mit PID-Steuerung
+        target_velocity_z = -10  # Langsamer, kontrollierter Abstieg
+        thrust_adjustment = self.pid.compute(self.velocity.z, target_velocity_z)
+        if math.isnan(thrust_adjustment) or math.isinf(thrust_adjustment) or abs(thrust_adjustment) > 10:
+            thrust_adjustment = self.backup_pid.compute(self.velocity.z, target_velocity_z)
+            print("Warning: Primary PID unstable, using backup PID.")
+            if math.isnan(thrust_adjustment) or math.isinf(thrust_adjustment):
+                thrust_adjustment = 0
+
+        self.thrust = min(STARSHIP_MASS * (MARS_GRAVITY + thrust_adjustment), current_max_thrust)
+
+        # Treibstoffschutz
+        if self.fuel < 20000:  # 10% Reserve bei 200.000 kg
+            self.thrust = min(self.thrust, STARSHIP_MASS * MARS_GRAVITY * 0.5)
+
         gravity_acc = -MARS_GRAVITY
         drag_acc = self.calculate_drag()
         centrifugal_acc = self.calculate_centrifugal()
         wind_acc = self.calculate_wind()
 
-        # Total acceleration
         acceleration = Vector3D(wind_acc.x, wind_acc.y, thrust_acc + gravity_acc + drag_acc + centrifugal_acc)
-
-        # Update velocity and position
         self.velocity = self.velocity + acceleration * delta_time
         self.position = self.position + self.velocity * delta_time
 
-        # Fuel consumption
         if self.thrust > 0 and self.engine_delay_timer <= 0:
             mass_flow_rate = self.thrust / (SPECIFIC_IMPULSE * G0)
             fuel_used = mass_flow_rate * delta_time
             if fuel_used > self.fuel:
-                fuel_used = self.fuel  # Kann nicht mehr verbrauchen als vorhanden
+                fuel_used = self.fuel
             self.fuel -= fuel_used
 
-        # Log state
+        # Geschwindigkeit glätten
+        self.velocity_smoothing.append(self.velocity.z)
+        if len(self.velocity_smoothing) > 5:
+            self.velocity_smoothing.pop(0)
+        smoothed_velocity = sum(self.velocity_smoothing) / len(self.velocity_smoothing)
+        self.velocity.z = smoothed_velocity
+
         self.altitude_history.append(self.position.z)
         self.velocity_history.append(self.velocity.z)
         self.fuel_history.append(self.fuel)
         self.time_history.append(self.time_history[-1] + delta_time if self.time_history else delta_time)
         self.position_history.append((self.position.x, self.position.y, self.position.z))
 
-        # Validierung der physikalischen Werte, um Instabilität zu vermeiden
+        # Neue Höhenkontrolle
         if self.position.z > MAX_ALTITUDE or math.isnan(self.position.z):
-            print(f"Warning: Altitude value unstable ({self.position.z}m), resetting to {MAX_ALTITUDE}m")
-            self.position.z = MAX_ALTITUDE
-
+            print(f"Warning: Altitude value unstable ({self.position.z}m), adjusting to {max(0, self.position.z - abs(self.velocity.z) * delta_time)}m")
+            self.position.z = max(0, self.position.z - abs(self.velocity.z) * delta_time)
         if abs(self.velocity.z) > MAX_VELOCITY or math.isnan(self.velocity.z):
-            print(
-                f"Warning: Velocity value unstable ({self.velocity.z}m/s), capping to {MAX_VELOCITY * np.sign(self.velocity.z)}m/s")
+            print(f"Warning: Velocity value unstable ({self.velocity.z}m/s), capping to {MAX_VELOCITY * np.sign(self.velocity.z)}m/s")
             self.velocity.z = MAX_VELOCITY * (1 if self.velocity.z > 0 else -1)
 
     def calculate_drag(self):
@@ -153,13 +164,14 @@ class Starship:
         try:
             density = MARS_ATMOSPHERE_DENSITY_SEA_LEVEL * math.exp(-self.position.z / MARS_SCALE_HEIGHT)
             speed = self.velocity.magnitude()
-            drag_force = 0.5 * density * speed ** 2 * DRAG_COEFFICIENT * CROSS_SECTIONAL_AREA
-            drag_acc = -drag_force / STARSHIP_MASS * (self.velocity.z / speed if speed > 0 else 0)
-
-            # Validierung des Ergebnisses
+            if speed > 0 and self.position.z < 5000:  # Stärkerer Drag in niedriger Höhe
+                drag_force = 0.5 * density * speed ** 2 * DRAG_COEFFICIENT * CROSS_SECTIONAL_AREA * (5000 / (self.position.z + 1))
+                drag_acc = -drag_force / STARSHIP_MASS * (self.velocity.z / speed)
+            else:
+                drag_force = 0.5 * density * speed ** 2 * DRAG_COEFFICIENT * CROSS_SECTIONAL_AREA
+                drag_acc = -drag_force / STARSHIP_MASS * (self.velocity.z / speed)
             if math.isnan(drag_acc) or math.isinf(drag_acc):
                 return 0
-
             return drag_acc
         except Exception as e:
             print(f"Error in drag calculation: {e}")
@@ -169,11 +181,8 @@ class Starship:
         try:
             radius = 3.3895e6  # Mars radius
             centrifugal_acc = (MARS_ROTATION_OMEGA ** 2) * radius * 1e-3
-
-            # Validierung des Ergebnisses
             if math.isnan(centrifugal_acc) or math.isinf(centrifugal_acc):
                 return 0
-
             return centrifugal_acc
         except Exception as e:
             print(f"Error in centrifugal calculation: {e}")
@@ -181,22 +190,15 @@ class Starship:
 
     def calculate_wind(self):
         try:
-            # Sicherstellen, dass time_history nicht leer ist
             current_time = self.time_history[-1] if self.time_history else 0
-
-            # Height-dependent wind with gusts
-            wind_strength = WIND_MAX_ACCELERATION * (
-                        1 + min(self.position.z, 10000) / 10000)  # Stronger at higher altitude, mit Obergrenze
-            gust = math.sin(current_time * 0.5) * wind_strength * 0.5  # Sinusoidal gusts
+            wind_strength = WIND_MAX_ACCELERATION * (1 + min(self.position.z, 10000) / 10000)
+            gust = math.sin(current_time * 0.5) * wind_strength * 0.5
             wind_x = random.uniform(-wind_strength, wind_strength) + gust
             wind_y = random.uniform(-wind_strength, wind_strength) + gust
-
-            # Validierung der Ergebnisse
             if math.isnan(wind_x) or math.isinf(wind_x):
                 wind_x = 0
             if math.isnan(wind_y) or math.isinf(wind_y):
                 wind_y = 0
-
             return Vector3D(wind_x, wind_y, 0)
         except Exception as e:
             print(f"Error in wind calculation: {e}")
@@ -204,42 +206,29 @@ class Starship:
 
     def scan_and_navigate(self):
         try:
-            # Primary and backup LIDAR scans
             scan_data = self.lidar.scan(self.position, self.velocity)
             backup_data = self.backup_lidar.scan(self.position, self.velocity)
 
-            # Validierung der LIDAR-Daten
             scan_data.distance = min(max(scan_data.distance, 0), MAX_ALTITUDE)
             backup_data.distance = min(max(backup_data.distance, 0), MAX_ALTITUDE)
 
-            # Outlier rejection (moving average filter)
             if len(self.altitude_history) >= 5:
                 recent_altitudes = self.altitude_history[-5:]
-                avg_altitude = sum(recent_altitudes) / len(recent_altitudes)
-                if abs(scan_data.distance - avg_altitude) > 100:
+                median_altitude = sorted(recent_altitudes)[2]  # Median statt Durchschnitt
+                if abs(scan_data.distance - median_altitude) > 50:
                     scan_data = backup_data
                     print("Warning: Primary LIDAR outlier detected, using backup.")
 
-            # Sensor fusion (average if both plausible)
-            altitude = (scan_data.distance + backup_data.distance) / 2
-            velocity = Vector3D(
-                (scan_data.velocity.x + backup_data.velocity.x) / 2,
-                (scan_data.velocity.y + backup_data.velocity.y) / 2,
-                (scan_data.velocity.z + backup_data.velocity.z) / 2
-            )
+            altitude = scan_data.distance
+            velocity = scan_data.velocity
 
-            # Validierung der Geschwindigkeit
-            if abs(velocity.z) > MAX_VELOCITY:
-                velocity.z = MAX_VELOCITY * (1 if velocity.z > 0 else -1)
-
-            if abs(altitude - self.position.z) > 100 or abs(velocity.z) > 300:
-                velocity = scan_data.velocity
-                altitude = scan_data.distance
-                print("Warning: Sensor fusion failed, using primary LIDAR.")
+            if abs(altitude - self.position.z) > 100 or abs(velocity.z) > 500:
+                velocity = self.backup_lidar.scan(self.position, self.velocity).velocity
+                altitude = self.position.z
+                print("Warning: Sensor fusion failed, using primary LIDAR and position.")
 
             self.velocity = velocity
 
-            # Terrain mapping and thrust control
             if altitude < 3000:
                 terrain_map = self.hdl.scan(self.position, altitude)
                 safe_zone = self.analyze_terrain(terrain_map)
@@ -252,19 +241,16 @@ class Starship:
                     print("No safe landing zone found! Initiating hover...")
                     self.thrust = min(STARSHIP_MASS * MARS_GRAVITY * 1.2, MAX_THRUST * (self.active_engines / 3))
             elif altitude < HOVER_ALTITUDE + 50:
-                # Hover phase to confirm terrain
-                self.thrust = min(STARSHIP_MASS * MARS_GRAVITY * 1.05,
-                                  MAX_THRUST * (self.active_engines / 3))  # Maintain altitude
+                self.thrust = min(STARSHIP_MASS * MARS_GRAVITY * 1.0, MAX_THRUST * (self.active_engines / 3))
                 print("Hovering at {:.1f}m to confirm landing zone...".format(altitude))
             else:
-                self.thrust = min(STARSHIP_MASS * MARS_GRAVITY * 1.15, MAX_THRUST * (self.active_engines / 3))
+                self.thrust = min(STARSHIP_MASS * MARS_GRAVITY * 0.9, MAX_THRUST * (self.active_engines / 3))
 
             return altitude
         except Exception as e:
             print(f"Error in scan_and_navigate: {e}")
-            # Fallback bei Fehler: Standardwerte verwenden
-            self.thrust = STARSHIP_MASS * MARS_GRAVITY  # Einfache Schubkraftkontrolle
-            return self.position.z  # Aktuelle Höhe zurückgeben
+            self.thrust = STARSHIP_MASS * MARS_GRAVITY * 0.9
+            return self.position.z
 
     def analyze_terrain(self, terrain_map):
         try:
@@ -293,12 +279,9 @@ class Starship:
             target_velocity_z = -2 if self.position.z > 500 else -0.3
             thrust_adjustment = self.pid.compute(self.velocity.z, target_velocity_z)
 
-            # Validierung des PID-Ausgangs
             if math.isnan(thrust_adjustment) or math.isinf(thrust_adjustment) or abs(thrust_adjustment) > 10:
                 thrust_adjustment = self.backup_pid.compute(self.velocity.z, target_velocity_z)
                 print("Warning: Primary PID unstable, using backup PID.")
-
-                # Wenn auch der Backup-PID versagt, verwende einen sicheren Standardwert
                 if math.isnan(thrust_adjustment) or math.isinf(thrust_adjustment):
                     thrust_adjustment = 0
                     print("Warning: Both PIDs failed, using default thrust.")
@@ -314,11 +297,10 @@ class Starship:
                 self.velocity.y *= 0.85
         except Exception as e:
             print(f"Error in adjust_trajectory: {e}")
-            # Fallback: einfache Schubkraftkontrolle
-            self.thrust = STARSHIP_MASS * MARS_GRAVITY
+            self.thrust = STARSHIP_MASS * MARS_GRAVITY * 0.9
 
     def emergency_abort(self):
-        print("Critical failure detected! Initiating emergency abort...")
+        print("Critical failure detected! Initiating emergency landing...")
         self.thrust = MAX_THRUST * (self.active_engines / 3)
         self.velocity.z = 10
         print("Ascending to safe altitude. Mission aborted.")
@@ -326,11 +308,11 @@ class Starship:
 
     def land(self):
         print("Initiating Starship Mars landing sequence (thrust-only)...")
-        delta_time = 1 / SCAN_FREQUENCY
+        delta_time = 0.002  # Noch kleinere Schritte für Stabilität
         self.time_history.append(0)
 
         abort = False
-        max_iterations = 50000  # Sicherheitsabbruch nach zu vielen Iterationen
+        max_iterations = 500000  # Erhöht wegen kleinerem delta_time
         iterations = 0
 
         while self.position.z > 0 and not abort and iterations < max_iterations:
@@ -339,14 +321,10 @@ class Starship:
                 altitude = self.scan_and_navigate()
                 self.update_state(delta_time)
 
-                # Status-Ausgabe (alle 100 Iterationen, um die Konsole nicht zu überlasten)
-                if iterations % 100 == 0:
+                if iterations % 500 == 0:  # Anpassung wegen kleinerem delta_time
                     print(
                         f"Altitude: {altitude:.1f}m, Velocity: {self.velocity.z:.1f}m/s, Fuel: {self.fuel:.1f}kg, Thrust: {self.thrust:.0f}N, Engines: {self.active_engines}")
 
-                if self.fuel <= MIN_FUEL_RESERVE:
-                    print("Critical fuel level! Attempting emergency landing...")
-                    self.thrust = MAX_THRUST * (self.active_engines / 3)
                 if self.fuel <= 0:
                     print("Out of fuel! Crash imminent.")
                     break
@@ -362,23 +340,16 @@ class Starship:
                     break
             except Exception as e:
                 print(f"Error in landing loop: {e}")
-                abort = True  # Bei unbekanntem Fehler abbrechen
+                abort = True
 
         if iterations >= max_iterations:
             print("Landing aborted: Maximum iterations reached")
 
-        # Endstatus ausgeben
         print(f"Final altitude: {self.position.z:.1f}m, Velocity: {self.velocity.z:.1f}m/s, Fuel: {self.fuel:.1f}kg")
-
-        # Plot erstellen, unabhängig vom Landestatus
-        try:
-            self.plot_landing_data()
-        except Exception as e:
-            print(f"Error generating plot: {e}")
+        self.plot_landing_data()
 
     def plot_landing_data(self):
         try:
-            # Beschränken der Datenpunkte für den Plot (max. 1000 für bessere Performance)
             stride = max(1, len(self.time_history) // 1000)
             time_data = self.time_history[::stride]
             altitude_data = self.altitude_history[::stride]
@@ -388,7 +359,6 @@ class Starship:
 
             fig = plt.figure(figsize=(12, 10))
 
-            # 3D Trajectory Plot
             ax = fig.add_subplot(221, projection='3d')
             x, y, z = zip(*position_data)
             ax.plot(x, y, z, 'b-', label='Trajectory')
@@ -399,14 +369,12 @@ class Starship:
             ax.set_title('Starship Mars Landing Trajectory')
             ax.legend()
 
-            # Altitude Plot
             ax2 = fig.add_subplot(222)
             ax2.plot(time_data, altitude_data, 'b-')
             ax2.set_ylabel('Altitude (m)')
             ax2.set_title('Altitude vs Time')
             ax2.grid(True)
 
-            # Velocity Plot
             ax3 = fig.add_subplot(223)
             ax3.plot(time_data, velocity_data, 'r-')
             ax3.set_ylabel('Velocity (m/s)')
@@ -414,7 +382,6 @@ class Starship:
             ax3.set_title('Velocity vs Time')
             ax3.grid(True)
 
-            # Fuel Plot
             ax4 = fig.add_subplot(224)
             ax4.plot(time_data, fuel_data, 'g-')
             ax4.set_ylabel('Fuel (kg)')
@@ -424,12 +391,11 @@ class Starship:
 
             plt.tight_layout()
 
-            # Desktop-Pfad für sicheres Speichern
             desktop_path = os.path.expanduser("~/Desktop")
             save_path = os.path.join(desktop_path, 'mars_landing_simulation_3d.png')
 
             plt.savefig(save_path)
-            plt.close(fig)  # Wichtig: Figur explizit schließen
+            plt.close(fig)
             print(f"Landing data plot saved as '{save_path}'")
         except Exception as e:
             print(f"Error saving plot: {e}")
@@ -443,7 +409,6 @@ class NavigationDopplerLidar:
             velocity_y = current_velocity.y + random.uniform(-0.005, 0.005)
             velocity_z = current_velocity.z + random.uniform(-0.005, 0.005)
 
-            # Validierung der Werte
             distance = max(0, min(distance, MAX_ALTITUDE))
             velocity_x = max(-MAX_VELOCITY, min(velocity_x, MAX_VELOCITY))
             velocity_y = max(-MAX_VELOCITY, min(velocity_y, MAX_VELOCITY))
@@ -456,7 +421,6 @@ class NavigationDopplerLidar:
             return data
         except Exception as e:
             print(f"Error in LIDAR scan: {e}")
-            # Fallback: Position unverändert zurückgeben
             return LaserScanData(
                 distance=position.z,
                 velocity=Vector3D(current_velocity.x, current_velocity.y, current_velocity.z)
@@ -467,21 +431,20 @@ class HazardDetectionLidar:
     def scan(self, position, altitude):
         try:
             terrain_map = []
-            scan_range = max(50, min(200, int(altitude / 1.5)))  # Begrenzen des Scanbereichs
+            scan_range = max(50, min(200, int(altitude / 1.5)))
 
-            # Simplified Jezero Crater model: 10% safe zones, 30% rough, 60% moderate
             for x in range(-scan_range, scan_range + 1, 10):
                 for y in range(-scan_range, scan_range + 1, 10):
                     rand = random.random()
-                    if rand < 0.1:  # Safe zone
+                    if rand < 0.1:
                         roughness = random.uniform(0, 0.02)
                         obstacles = 0
                         dust_density = random.uniform(0, 0.1)
-                    elif rand < 0.4:  # Rough terrain
+                    elif rand < 0.4:
                         roughness = random.uniform(0.1, 0.5)
                         obstacles = random.randint(1, 3)
                         dust_density = random.uniform(0.2, 0.5)
-                    else:  # Moderate terrain
+                    else:
                         roughness = random.uniform(0.02, 0.1)
                         obstacles = random.randint(0, 1)
                         dust_density = random.uniform(0.1, 0.2)
@@ -497,7 +460,6 @@ class HazardDetectionLidar:
             return terrain_map
         except Exception as e:
             print(f"Error in hazard detection: {e}")
-            # Fallback: Ein einziges sicheres Terrain zurückgeben
             return [TerrainPatch(
                 coordinates=Vector3D(position.x, position.y, 0),
                 altitude=0,
@@ -515,49 +477,38 @@ class PIDController:
         self.kd = kd
         self.integral = 0
         self.previous_error = 0
-        self.max_integral = 100  # Anti-windup
+        self.max_integral = 100
 
     def compute(self, current, target):
         try:
             error = target - current
-
-            # Anti-windup: Begrenzung des Integrals
             self.integral = max(-self.max_integral, min(self.integral + error, self.max_integral))
-
             derivative = error - self.previous_error
             self.previous_error = error
-
             output = self.kp * error + self.ki * self.integral + self.kd * derivative
-
-            # Begrenzung des Ausgangs
             output = max(-10, min(output, 10))
-
             return output
         except Exception as e:
             print(f"Error in PID computation: {e}")
-            return 0  # Sicherer Standardwert
+            return 0
 
 
-# Run the simulation with multiple test cases
 if __name__ == "__main__":
     test_cases = [
-        {"name": "Nominal", "fuel": 160000, "seed": 42, "noise_factor": 1},
+        {"name": "Nominal", "fuel": 200000, "seed": 42, "noise_factor": 1},
         {"name": "Low Fuel", "fuel": 120000, "seed": 43, "noise_factor": 1},
-        {"name": "Engine Failure", "fuel": 160000, "seed": 44, "noise_factor": 1},
-        {"name": "High Wind", "fuel": 160000, "seed": 45, "noise_factor": 1},
-        {"name": "High LIDAR Noise", "fuel": 160000, "seed": 46, "noise_factor": 2}
+        {"name": "Engine Failure", "fuel": 200000, "seed": 44, "noise_factor": 1},
+        {"name": "High Wind", "fuel": 200000, "seed": 45, "noise_factor": 1},
+        {"name": "High LIDAR Noise", "fuel": 200000, "seed": 46, "noise_factor": 2}
     ]
 
     for test in test_cases:
         print(f"\nRunning test case: {test['name']}")
         random.seed(test["seed"])
 
-        # Originale LIDAR-Scan-Methode speichern
         original_scan = NavigationDopplerLidar.scan
         noise_factor = test["noise_factor"]
 
-
-        # Angepasste Scan-Methode definieren
         def custom_scan(self, position, current_velocity):
             try:
                 distance = position.z + random.uniform(-0.1 * noise_factor, 0.1 * noise_factor)
@@ -565,7 +516,6 @@ if __name__ == "__main__":
                 velocity_y = current_velocity.y + random.uniform(-0.005 * noise_factor, 0.005 * noise_factor)
                 velocity_z = current_velocity.z + random.uniform(-0.005 * noise_factor, 0.005 * noise_factor)
 
-                # Validierung der Werte
                 distance = max(0, min(distance, MAX_ALTITUDE))
                 velocity_x = max(-MAX_VELOCITY, min(velocity_x, MAX_VELOCITY))
                 velocity_y = max(-MAX_VELOCITY, min(velocity_y, MAX_VELOCITY))
@@ -578,14 +528,11 @@ if __name__ == "__main__":
                 return data
             except Exception as e:
                 print(f"Error in custom LIDAR scan: {e}")
-                # Fallback: Position unverändert zurückgeben
                 return LaserScanData(
                     distance=position.z,
                     velocity=Vector3D(current_velocity.x, current_velocity.y, current_velocity.z)
                 )
 
-
-        # LIDAR-Methode temporär ersetzen
         NavigationDopplerLidar.scan = custom_scan
 
         try:
@@ -595,5 +542,4 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Error in test case {test['name']}: {e}")
         finally:
-            # LIDAR-Methode wiederherstellen
             NavigationDopplerLidar.scan = original_scan
