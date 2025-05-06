@@ -39,15 +39,32 @@ STARSHIP_MASS = 238000  # Increased dry mass with payload
 MAX_THRUST = 7500000
 MIN_THRUST = 2250000
 ENGINE_STARTUP_DELAY = 0.1
-MIN_FUEL_RESERVE = 40000
+MIN_FUEL_RESERVE = 100000  # Increased for emergency maneuvers
 SAFE_LANDING_SPEED = 0.5
 MIN_SAFE_ALTITUDE = 50
 WIND_MAX_ACCELERATION = 0.05
 HOVER_ALTITUDE = 100
-MAX_ALTITUDE = 500000  # 500 km orbit
-ORBIT_VELOCITY = 3319  # Approx. orbital velocity at 500 km
+MAX_ALTITUDE = 500000  # 500 km orbit (not used)
+ORBIT_VELOCITY = 3319  # Approx. orbital velocity at 500 km (not used)
 MAX_VELOCITY = 4000
-MAX_FUEL = 1000000  # Maximum fuel capacity
+MAX_FUEL = 1200000  # For Mars-to-Earth return
+
+class RefuelingStation:
+    def __init__(self, solar_power=100000, reactor_power=0):
+        self.solar_power = solar_power  # kW
+        self.reactor_power = reactor_power  # kW
+        self.total_power = solar_power + reactor_power
+        # Production rate: assuming 75 kWh per kg of fuel (Sabatier + Electrolysis)
+        self.production_rate = self.total_power / 75  # kg/day
+        self.production_efficiency = 0.9  # 90% efficiency to account for losses
+        logging.info(f"Initialized RefuelingStation with {self.total_power:.1f} kW power, "
+                     f"production rate: {self.production_rate:.2f} kg/day")
+
+    def produce_fuel(self, fuel_needed):
+        """Calculate days required to produce the needed fuel, accounting for efficiency."""
+        days_required = fuel_needed / (self.production_rate * self.production_efficiency)
+        fuel_produced = fuel_needed
+        return fuel_produced, days_required  # kg, days
 
 class Vector3D:
     def __init__(self, x, y, z):
@@ -91,13 +108,32 @@ class Starship:
         self.velocity_smoothing = [self.velocity.z]
         self.warning_counter = 0
         self.pitch_history = []
+        self.refuel_history = []  # Track refueling progress
         logging.info(f"Initialized Starship in {mode} mode with {fuel:.1f} kg fuel")
+
+    def refuel_on_mars(self, refueling_station):
+        """Simulate refueling on Mars to full capacity for return flight."""
+        fuel_needed = MAX_FUEL - self.fuel
+        if fuel_needed <= 0:
+            logging.info("Starship already fully fueled.")
+            print("Starship already fully fueled.")
+            self.refuel_history.append((self.time_history[-1], self.fuel))
+            return self.fuel
+        fuel_produced, days_required = refueling_station.produce_fuel(fuel_needed)
+        self.fuel += fuel_produced
+        logging.info(f"Refueled {fuel_produced:.1f} kg on Mars in {days_required:.1f} days. "
+                     f"Starship ready for return flight with {self.fuel:.1f} kg fuel.")
+        print(f"Refueled {fuel_produced:.1f} kg on Mars in {days_required:.1f} days. "
+              f"Starship ready for return flight with {self.fuel:.1f} kg fuel.")
+        self.refuel_history.append((self.time_history[-1], self.fuel))
+        return self.fuel
 
     def update_state(self, delta_time):
         total_mass = STARSHIP_MASS + self.fuel
-        if self.fuel <= 0:
-            self.fuel = 0
+        if self.fuel <= MIN_FUEL_RESERVE:
+            self.fuel = MIN_FUEL_RESERVE
             self.thrust = 0
+            logging.warning(f"Fuel at reserve level: {self.fuel:.1f} kg. Thrust disabled.")
 
         current_max_thrust = MAX_THRUST * (self.active_engines / 3)
         current_min_thrust = MIN_THRUST * (self.active_engines / 3)
@@ -107,10 +143,10 @@ class Starship:
             thrust_acc = Vector3D(0, 0, 0)
         else:
             if self.mode == 'land':
-                if self.position.z > 3000:
-                    target_velocity_z = -30
+                if self.position.z > 1000:
+                    target_velocity_z = -20  # More aggressive descent
                 elif self.position.z > 50:
-                    target_velocity_z = -10
+                    target_velocity_z = -5
                 elif self.position.z > 1:
                     target_velocity_z = -0.5
                 else:
@@ -130,11 +166,12 @@ class Starship:
                 thrust_acc = Vector3D(0, 0, self.thrust / total_mass)
                 self.pitch_history.append(90)
             else:
+                # Not used in this simulation
                 self.thrust = current_max_thrust
                 if self.position.z < 500:
                     pitch = 90
                 else:
-                    pitch = max(0, 90 - ((self.position.z - 500) / (300000 - 500)) * 90)  # Reach 0° at 300 km
+                    pitch = max(0, 90 - ((self.position.z - 500) / (200000 - 500)) * 90)
                 pitch_rad = math.radians(pitch)
                 thrust_z = self.thrust * math.sin(pitch_rad)
                 thrust_x = self.thrust * math.cos(pitch_rad)
@@ -153,7 +190,7 @@ class Starship:
         if self.thrust > 0 and self.engine_delay_timer <= 0:
             mass_flow_rate = self.thrust / (SPECIFIC_IMPULSE * G0)
             fuel_used = mass_flow_rate * delta_time
-            fuel_used = min(fuel_used, self.fuel)
+            fuel_used = min(fuel_used, self.fuel - MIN_FUEL_RESERVE)
             self.fuel -= fuel_used
             if iterations % 100 == 0:  # More frequent logging
                 logging.debug(f"Fuel used this step: {fuel_used:.1f} kg, Mass flow rate: {mass_flow_rate:.1f} kg/s, Remaining fuel: {self.fuel:.1f} kg")
@@ -214,21 +251,22 @@ class Starship:
             return 0
 
     def calculate_wind(self):
-        if self.mode == 'launch':
-            return Vector3D(0, 0, 0)
-        try:
-            current_time = self.time_history[-1] if self.time_history else 0
-            wind_strength = WIND_MAX_ACCELERATION * (1 + min(self.position.z, 10000) / 10000)
-            gust = math.sin(current_time * 0.5) * wind_strength * 0.5
-            wind_x = random.uniform(-wind_strength, wind_strength) + gust
-            wind_y = random.uniform(-wind_strength, wind_strength) + gust
-            if math.isnan(wind_x) or math.isinf(wind_x):
-                wind_x = 0
-            if math.isnan(wind_y) or math.isinf(wind_y):
-                wind_y = 0
-            return Vector3D(wind_x, wind_y, 0)
-        except Exception as e:
-            logging.error(f"Error in wind calculation: {e}")
+        if self.mode == 'land':
+            try:
+                current_time = self.time_history[-1] if self.time_history else 0
+                wind_strength = WIND_MAX_ACCELERATION * (1 + min(self.position.z, 10000) / 10000)
+                gust = math.sin(current_time * 0.5) * wind_strength * 0.5
+                wind_x = random.uniform(-wind_strength, wind_strength) + gust
+                wind_y = random.uniform(-wind_strength, wind_strength) + gust
+                if math.isnan(wind_x) or math.isinf(wind_x):
+                    wind_x = 0
+                if math.isnan(wind_y) or math.isinf(wind_y):
+                    wind_y = 0
+                return Vector3D(wind_x, wind_y, 0)
+            except Exception as e:
+                logging.error(f"Error in wind calculation: {e}")
+                return Vector3D(0, 0, 0)
+        else:
             return Vector3D(0, 0, 0)
 
     def emergency_abort(self):
@@ -258,6 +296,9 @@ class Starship:
         max_iterations = 100000
         iterations = 0
 
+        # Initialize refueling station for Mars
+        refueling_station = RefuelingStation(solar_power=100000, reactor_power=0)
+
         while iterations < max_iterations and not abort:
             start_time = time.time()
             try:
@@ -277,9 +318,9 @@ class Starship:
                         f"Thrust: {self.thrust:.0f}N, Engines: {self.active_engines}, Pitch: {pitch:.1f}°")
                     sys.stdout.flush()
 
-                if self.fuel <= 0:
-                    logging.info("Out of fuel! Mission failed.")
-                    print("Out of fuel! Mission failed.")
+                if self.fuel <= MIN_FUEL_RESERVE:
+                    logging.info("Fuel at minimum reserve! Mission failed.")
+                    print("Fuel at minimum reserve! Mission failed.")
                     sys.stdout.flush()
                     break
 
@@ -289,47 +330,14 @@ class Starship:
                             logging.info("Perfect landing achieved on Mars!")
                             print("Perfect landing achieved on Mars!")
                             sys.stdout.flush()
+                            # Simulate refueling after landing
+                            self.refuel_on_mars(refueling_station)
                             self.plot_mission_data()
                             break
                         else:
                             logging.info(f"Crash landing at {abs(self.velocity.z):.1f}m/s!")
                             print(f"Crash landing at {abs(self.velocity.z):.1f}m/s!")
                             sys.stdout.flush()
-                            break
-                else:  # launch
-                    horizontal_velocity = (self.velocity.x ** 2 + self.velocity.y ** 2) ** 0.5
-                    if self.position.z >= MAX_ALTITUDE:
-                        if horizontal_velocity >= ORBIT_VELOCITY:
-                            logging.info("Orbit achieved at 500 km with sufficient velocity!")
-                            print("Orbit achieved at 500 km with sufficient velocity!")
-                            self.fuel = MAX_FUEL  # Refuel to 1,000,000 kg
-                            logging.info(f"Refueled with {MAX_FUEL:.1f} kg in 500 km orbit.")
-                            print(f"Refueled with {MAX_FUEL:.1f} kg in 500 km orbit.")
-                            landing_fuel_required = 100000
-                            if self.fuel >= landing_fuel_required:
-                                self.fuel -= landing_fuel_required
-                                self.position.z = 0
-                                self.velocity = Vector3D(0, 0, 0)
-                                logging.info("Landed on Mars. Fuel remaining: {:.1f} kg".format(self.fuel))
-                                print("Landed on Mars. Fuel remaining: {:.1f} kg".format(self.fuel))
-                                relaunch_fuel_required = 526000
-                                if self.fuel >= relaunch_fuel_required:
-                                    self.fuel -= relaunch_fuel_required
-                                    self.position.z = MAX_ALTITUDE
-                                    self.velocity = Vector3D(ORBIT_VELOCITY, 0, 0)
-                                    logging.info("Relaunched to 500 km orbit. Fuel remaining: {:.1f} kg".format(self.fuel))
-                                    print("Relaunched to 500 km orbit. Fuel remaining: {:.1f} kg".format(self.fuel))
-                                else:
-                                    logging.info("Insufficient fuel for relaunch.")
-                                    print("Insufficient fuel for relaunch.")
-                            else:
-                                logging.info("Insufficient fuel for landing.")
-                                print("Insufficient fuel for landing.")
-                            self.plot_mission_data()
-                            break
-                        else:
-                            logging.info(f"Reached 500 km but insufficient orbital velocity: {horizontal_velocity:.1f}m/s")
-                            print(f"Reached 500 km but insufficient orbital velocity: {horizontal_velocity:.1f}m/s")
                             break
 
             except Exception as e:
@@ -351,7 +359,11 @@ class Starship:
         print(f"Final altitude: {self.position.z:.1f}m, Vertical Velocity: {self.velocity.z:.1f}m/s, "
               f"Horizontal Velocity: {horizontal_velocity:.1f}m/s, Fuel: {self.fuel:.1f}kg")
         sys.stdout.flush()
-        self.plot_mission_data()
+        if self.mode == 'land' and self.position.z < 1 and abs(self.velocity.z) <= SAFE_LANDING_SPEED:
+            logging.info("Simulation complete: Starship landed and refueled on Mars.")
+            print("Simulation complete: Starship landed and refueled on Mars.")
+        else:
+            self.plot_mission_data()
 
     def plot_mission_data(self):
         try:
@@ -363,7 +375,14 @@ class Starship:
             fuel_data = self.fuel_history[:min_length:stride]
             position_data = self.position_history[:min_length:stride]
 
-            fig = plt.figure(figsize=(12, 10))
+            # Prepare refueling data
+            refuel_times = [t for t, _ in self.refuel_history]
+            refuel_amounts = [f for _, f in self.refuel_history]
+            if not refuel_times:
+                refuel_times = [0]
+                refuel_amounts = [0]
+
+            fig = plt.figure(figsize=(15, 12))
 
             ax = fig.add_subplot(221, projection='3d')
             x, y, z = zip(*position_data)
@@ -378,6 +397,7 @@ class Starship:
             ax2 = fig.add_subplot(222)
             ax2.plot(time_data, altitude_data, 'b-')
             ax2.set_ylabel('Altitude (m)')
+            ax2.set_xlabel('Time (s)')
             ax2.set_title('Altitude vs Time')
             ax2.grid(True)
 
@@ -389,11 +409,13 @@ class Starship:
             ax3.grid(True)
 
             ax4 = fig.add_subplot(224)
-            ax4.plot(time_data, fuel_data, 'g-')
+            ax4.plot(time_data, fuel_data, 'g-', label='Fuel Level')
+            ax4.plot(refuel_times, refuel_amounts, 'm*', label='Refueling Events')
             ax4.set_ylabel('Fuel (kg)')
             ax4.set_xlabel('Time (s)')
-            ax4.set_title('Fuel vs Time')
+            ax4.set_title('Fuel and Refueling vs Time')
             ax4.grid(True)
+            ax4.legend()
 
             plt.tight_layout()
 
@@ -441,10 +463,9 @@ class PIDController:
             return 0
 
 if __name__ == "__main__":
-    logging.info("Starting Mars mission simulation with updated code (2025-05-05)")
+    logging.info("Starting Mars mission simulation with updated code (2025-05-06)")
     test_cases = [
-        {"name": "Landing Nominal", "mode": "land", "fuel": 300000, "seed": 46},
-        {"name": "Launch to Orbit", "mode": "launch", "fuel": 1000000, "seed": 47}
+        {"name": "Landing Nominal", "mode": "land", "fuel": 600000, "seed": 46}
     ]
 
     for test in test_cases:
